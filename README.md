@@ -8,7 +8,7 @@ For IKT 460 (RL) base Chinese Checkers
   - either by moving one step in any direction to an adjacent empty space,
   - or by jumping in one or any number of available consecutive hops over other single pieces.
 - A player may not combine hopping with a single-step move :: a move consists of one or the other.
-- A pin maynot go into a 'coloured triangle' unless it is either its source or its destination
+- ~~A pin maynot go into a 'coloured triangle' unless it is either its source or its destination~~ A pin may go into any coloured region, provided it is a valid move
 - There is no capturing
 
 ## single system
