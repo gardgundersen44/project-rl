@@ -1,6 +1,6 @@
-# =========================
-# game.py — with full scoring
-# =========================
+# ==========================================================
+# game.py — SERVER
+# ==========================================================
 
 import os
 import json
@@ -8,40 +8,32 @@ import uuid
 import time
 import socket
 import threading
-import math
 from datetime import datetime
 from typing import Dict, List, Optional, Any
-
+import math
+import random
+# Game logic imports
 from checkers_board import HexBoard
 from checkers_pins import Pin
 
-# --------------------------------------
-# CONFIG
-# --------------------------------------
-HOST = "0.0.0.0"
-PORT = 50555
 
-GAMES_DIR = "games"
-os.makedirs(GAMES_DIR, exist_ok=True)
 
-DEBUG_NET = os.getenv("DEBUG_NET", "0") not in ("0", "false", "False", "")
-
-def debug(*args):
-    if DEBUG_NET:
-        print("[NET]", *args)
-
-# --------------------------------------
+# ==========================================================
 # Utilities
-# --------------------------------------
+# ==========================================================
 def ts() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+
 def log_path(game_id: str) -> str:
-    return os.path.join(GAMES_DIR, f"game_{game_id}.log")
+    os.makedirs("games", exist_ok=True)
+    return os.path.join("games", f"game_{game_id}.log")
+
 
 def write_log(game_id: str, msg: str):
     with open(log_path(game_id), "a", encoding="utf-8") as f:
         f.write(f"[{ts()}] {msg}\n")
+
 
 def safe_json(obj: Any) -> str:
     try:
@@ -50,69 +42,73 @@ def safe_json(obj: Any) -> str:
         return json.dumps({"ok": False, "error": f"json-encode-failed: {e}"})
 
 
-# --------------------------------------
-# Game constants
-# --------------------------------------
+# ==========================================================
+# Game Constants
+# ==========================================================
 COLOUR_ORDER = ['red', 'lawn green', 'yellow', 'blue', 'gray0', 'purple']
 PRIMARY_COLOURS = ['red', 'lawn green', 'yellow']
+random.shuffle(PRIMARY_COLOURS)
 COMPLEMENT = {'red': 'blue', 'lawn green': 'gray0', 'yellow': 'purple'}
-
 MAX_PLAYERS = 6
 TURN_TIMEOUT_SEC = 10
-GAME_TIME_LIMIT_SEC = 1 * 60
+GAME_TIME_LIMIT_SEC = 60
 
-# --------------------------------------
-# Player class
-# --------------------------------------
+
+# ==========================================================
+# Player Class
+# ==========================================================
 class Player:
     def __init__(self, pid: str, name: str, colour: str):
         self.player_id = pid
         self.name = name
         self.colour = colour
-        self.ready = False  # Ready after sending "Start"
+        self.ready = False
         self.status = "PLAYING"
 
-        # Scoring stats:
+        # Scoring stats
         self.move_count = 0
         self.time_taken_sec = 0.0
 
 
-# --------------------------------------
-# Game class
-# --------------------------------------
+# ==========================================================
+# Game Class
+# ==========================================================
 class Game:
     def __init__(self):
         self.game_id = str(uuid.uuid4())
         self.board = HexBoard()
         self.players: List[Player] = []
         self.pins_by_colour: Dict[str, List[Pin]] = {}
-
-        self.status = "AVAILABLE"  # AVAILABLE / waiting / READY_TO_START / PLAYING / FINISHED
+        self.status = "AVAILABLE"
         self.created_ts = ts()
-
         self.joined_primary_index = 0
         self.lock_joining = False
 
-        self.total_start_ns: Optional[int] = None
-        self.turn_started_ns: Optional[int] = None
+        # Timing
+        self.total_start_ns = None
+        self.turn_started_ns = None
+
+        # Turn rotation
         self.turn_order: List[str] = []
         self.current_turn_index = 0
 
+        # Moves
         self.move_count = 0
         self.move_times_ms: List[float] = []
         self.last_move = None
+        self.turn_timeout_notice = None
 
-        self.turn_timeout_notice: Optional[str] = None
+        # Score dictionary
         self.scores: Dict[str, Dict[str, float]] = {}
 
-    # ------------------------
-    # Colour assignment
-    # ------------------------
+    # ----------------------------------
+    # Assign Colour
+    # ----------------------------------
     def assign_colour(self) -> Optional[str]:
         n = len(self.players) + 1
         if n > MAX_PLAYERS:
             return None
-        if n % 2 == 1:
+        if n % 2 == 1:  # primary
             if self.joined_primary_index >= len(PRIMARY_COLOURS):
                 return None
             return PRIMARY_COLOURS[self.joined_primary_index]
@@ -121,7 +117,7 @@ class Game:
             self.joined_primary_index += 1
             return COMPLEMENT[primary]
 
-    # ------------------------
+    # ----------------------------------
     def init_pins(self, colour: str):
         if colour in self.pins_by_colour:
             return
@@ -131,7 +127,7 @@ class Game:
             for i in range(len(idxs))
         ]
 
-    # ------------------------
+    # ----------------------------------
     def compute_turn_order(self):
         present = [p.colour for p in self.players]
         first = present[0]
@@ -143,7 +139,7 @@ class Game:
         self.turn_order = [c for c in rotated if c in present]
         self.current_turn_index = 0
 
-    # ------------------------
+    # ----------------------------------
     def current_turn_colour(self):
         if self.status != "PLAYING":
             return None
@@ -151,20 +147,20 @@ class Game:
             return None
         return self.turn_order[self.current_turn_index]
 
-    # ------------------------
+    # ----------------------------------
     def advance_turn(self):
         if self.turn_order:
             self.current_turn_index = (self.current_turn_index + 1) % len(self.turn_order)
-        self.turn_started_ns = time.perf_counter_ns()
+            self.turn_started_ns = time.perf_counter_ns()
 
-    # ------------------------
+    # ----------------------------------
     def ensure_time_limits(self):
-        # Global time limit
+        # Game time limit
         if self.total_start_ns:
             elapsed = (time.perf_counter_ns() - self.total_start_ns) / 1e9
             if elapsed > GAME_TIME_LIMIT_SEC:
                 self.status = "FINISHED"
-                self.turn_timeout_notice = "GAME TIME LIMIT REACHED. Terminating game."
+                self.turn_timeout_notice = "GAME TIME LIMIT REACHED."
                 self.compute_scores()
                 write_log(self.game_id, self.turn_timeout_notice)
                 return
@@ -181,24 +177,24 @@ class Game:
                 write_log(self.game_id, f"TURN TIMEOUT: {self.turn_timeout_notice}")
                 self.advance_turn()
 
-    # ------------------------
+    # ----------------------------------
     def check_player_status(self, colour: str) -> str:
         opposite = self.board.colour_opposites[colour]
         pins = self.pins_by_colour[colour]
 
-        # WIN: all pins reach opposite
+        # WIN: all pins reached opposite target zones
         if all(self.board.cells[p.axialindex].postype == opposite for p in pins):
             return "WIN"
 
-        # DRAW: no pin has moves
+        # DRAW: no possible moves
         if all(len(p.getPossibleMoves()) == 0 for p in pins):
             return "DRAW"
 
         return "PLAYING"
 
-    # =========================================================
-    # SCORING LOGIC
-    # =========================================================
+    # ----------------------------------
+    # Scoring Logic
+    # ----------------------------------
     def compute_scores(self):
         def axial_dist(a, b):
             dq = abs(a.q - b.q)
@@ -211,36 +207,31 @@ class Game:
             pins = self.pins_by_colour[colour]
             opposite = self.board.colour_opposites[colour]
 
-            # 1. TIME SCORE
-            time_score = max(0.0, 100.0 - pl.time_taken_sec) if pl.time_taken_sec>0 else 0
+            # Time score
+            time_score = max(0.0, 100.0 - pl.time_taken_sec) if pl.time_taken_sec > 0 else 0
 
-            # 2. MOVE SCORE
-            move_score_func = lambda x: math.exp(-((x-45)**2)/(2*((4 if x < 45 else 18)**2)))
-            move_score = move_score_func(pl.move_count) if pl.move_count>0 else 0 #max(0.0, 500.0 - pl.move_count * 5.0) 
+            # Move score — asymmetric Gaussian
+            move_score_func = lambda x: math.exp(-((x - 45) ** 2) /
+                                                 (2 * ((4 if x < 45 else 18) ** 2)))
+            move_score = move_score_func(pl.move_count) if pl.move_count > 0 else 0
 
-            # 3. PINS IN GOAL
-            pins_in_goal = 0
-            unreached = []
-            for p in pins:
-                cell = self.board.cells[p.axialindex]
-                if cell.postype == opposite:
-                    pins_in_goal += 1
-                else:
-                    unreached.append(p)
+            # Pins in goal
+            pins_in_goal = sum(
+                1 for p in pins
+                if self.board.cells[p.axialindex].postype == opposite
+            )
             pin_goal_score = pins_in_goal * 100.0
 
-            # 4. DISTANCE SCORE
+            # Distance score
             target_idxs = self.board.axial_of_colour(opposite)
             target_cells = [self.board.cells[i] for i in target_idxs]
-
             total_dist = 0
-            for p in unreached:
-                cell = self.board.cells[p.axialindex]
-                best = min(axial_dist(cell, tgt) for tgt in target_cells)
-                print(pl.colour, ' ', best)
-                total_dist += best
-
-            distance_score = max(0.0, 200.0 - total_dist ) if pl.move_count>0 else 0 #* 10.0)
+            for p in pins:
+                if self.board.cells[p.axialindex].postype != opposite:
+                    best = min(axial_dist(self.board.cells[p.axialindex], tgt)
+                               for tgt in target_cells)
+                    total_dist += best
+            distance_score = max(0.0, 200.0 - total_dist) if pl.move_count > 0 else 0
 
             final_score = time_score + move_score + pin_goal_score + distance_score
 
@@ -258,13 +249,14 @@ class Game:
 
             write_log(
                 self.game_id,
-                f"SCORE {pl.name} ({colour}): "
-                f"Final={final_score:.1f}, "
+                f"SCORE {pl.name} ({colour}): Final={final_score:.1f}, "
                 f"Time={time_score:.1f}, Moves({pl.move_count})={move_score:.1f}, "
                 f"Pins({pins_in_goal})={pin_goal_score:.1f}, Dist={distance_score:.1f}"
             )
 
-    # ------------------------
+    # ----------------------------------
+    # Public State
+    # ----------------------------------
     def to_public_state(self) -> Dict[str, Any]:
         return {
             "game_id": self.game_id,
@@ -301,28 +293,26 @@ class Session:
         self.session_games: List[str] = []
         self.lock = threading.RLock()
 
+    # ------------------------------
     def create_game(self) -> str:
         with self.lock:
             g = Game()
             self.games[g.game_id] = g
             self.session_games.append(g.game_id)
             write_log(g.game_id, "GAME CREATED")
+
             return g.game_id
 
+    # ------------------------------
     def pick_available_game(self) -> Optional[Game]:
         for gid in self.session_games:
             g = self.games[gid]
             if not g.lock_joining and len(g.players) < MAX_PLAYERS:
-                if g.status == "waiting for other player":
-                    return g
-
-        for gid in self.session_games:
-            g = self.games[gid]
-            if not g.lock_joining and len(g.players) < MAX_PLAYERS:
-                if g.status in ("AVAILABLE", "READY_TO_START"):
+                if g.status in ("waiting for other player", "AVAILABLE", "READY_TO_START"):
                     return g
         return None
 
+    # ------------------------------
     def join_request(self, player_name: str) -> Dict[str, Any]:
         with self.lock:
             g = self.pick_available_game()
@@ -345,6 +335,7 @@ class Session:
 
             write_log(g.game_id, f"PLAYER JOINED: {player_name} as {colour}")
 
+
             return {
                 "ok": True,
                 "game_id": g.game_id,
@@ -353,6 +344,7 @@ class Session:
                 "status": g.status,
             }
 
+    # ------------------------------
     def mark_start_ready(self, game_id: str, player_id: str) -> Dict[str, Any]:
         with self.lock:
             g = self.games.get(game_id)
@@ -367,17 +359,15 @@ class Session:
 
             if g.status == "READY_TO_START":
                 g.lock_joining = True
-
-            if len(g.players) >= 2 and all(pl.ready for pl in g.players):
-                g.status = "PLAYING"
-                g.total_start_ns = time.perf_counter_ns()
-                g.compute_turn_order()
-                g.turn_started_ns = time.perf_counter_ns()
-                write_log(g.game_id, f"GAME START — turn order {g.turn_order}")
+                if len(g.players) >= 2 and all(pl.ready for pl in g.players):
+                    g.status = "PLAYING"
+                    g.total_start_ns = time.perf_counter_ns()
+                    g.compute_turn_order()
+                    g.turn_started_ns = time.perf_counter_ns()
+                    write_log(g.game_id, f"GAME START — turn order {g.turn_order}")
 
             return {"ok": True, "status": g.status}
 
-    
     def get_legal_moves(self, game_id: str, player_id: str):
         with self.lock:
             g = self.games.get(game_id)
@@ -396,10 +386,7 @@ class Session:
 
             return {"ok": True, "legal_moves": legal}
 
-
-    # ======================================================
-    # APPLY MOVES + SCORING
-    # ======================================================
+    # ------------------------------
     def validate_and_apply_move(self, game_id: str, player_id: str, pin_id: int, to_index: int):
         with self.lock:
             g = self.games.get(game_id)
@@ -407,29 +394,27 @@ class Session:
                 return {"ok": False, "error": "Game not found"}
 
             g.ensure_time_limits()
+
             if g.status != "PLAYING":
                 return {"ok": False, "error": f"Game not in PLAYING: {g.status}"}
 
             pl = next((p for p in g.players if p.player_id == player_id), None)
             if not pl:
                 return {"ok": False, "error": "Player not in game"}
-            
-            if g.status == "FINISHED" and not g.scores:
-                g.compute_scores()
 
             if g.current_turn_colour() != pl.colour:
-                return {"ok": False, "error": "Not your turn"}
+                return {"ok": False, "error": f"Not {pl.colour}'s turn. "}
 
             pins = g.pins_by_colour[pl.colour]
             if not (0 <= pin_id < len(pins)):
                 return {"ok": False, "error": "Invalid pin ID"}
-            pin = pins[pin_id]
 
+            pin = pins[pin_id]
             legal = pin.getPossibleMoves()
             if to_index not in legal:
                 return {"ok": False, "error": "Illegal move"}
 
-            # TRACK TIME for scoring
+            # Time tracking
             if g.turn_started_ns:
                 dt = (time.perf_counter_ns() - g.turn_started_ns) / 1e9
                 pl.time_taken_sec += dt
@@ -447,6 +432,11 @@ class Session:
             pl.move_count += 1
             g.move_count += 1
             g.move_times_ms.append(move_ms)
+            if g.turn_timeout_notice is not None:
+                timeout_movenum = int(g.turn_timeout_notice.split('move')[1].split('.')[0].replace(' ',''))
+                print(g.turn_timeout_notice.split('move')[1], g.turn_timeout_notice.split('move')[1].split('.'))
+                if timeout_movenum<g.move_count:
+                    g.turn_timeout_notice = None
 
             g.last_move = {
                 "pin_id": pin_id,
@@ -456,30 +446,41 @@ class Session:
                 "colour": pl.colour,
                 "move_ms": move_ms,
             }
-
-            write_log(g.game_id, f"MOVE {g.move_count}: {pl.name} ({pl.colour}) {from_idx}->{to_index} [{move_ms:.2f}ms]")
+            write_log(
+                g.game_id,
+                f"MOVE {g.move_count}: {pl.name} ({pl.colour}) {from_idx}->{to_index} [{move_ms:.2f}ms]"
+            )
 
             # Check WIN / DRAW
             pl.status = g.check_player_status(pl.colour)
+
             if pl.status == "WIN":
                 g.status = "FINISHED"
                 g.compute_scores()
-                return {"ok": True, "status": "WIN", "state": g.to_public_state(), "msg":f"{pl.name} Wins"}
+
+                return {"ok": True, "status": "WIN", "state": g.to_public_state(),
+                        "msg": f"{pl.name} Wins"}
 
             if pl.status == "DRAW":
+                # Check if all others draw except one
                 live = g.players
                 draws = [p for p in live if g.check_player_status(p.colour) == "DRAW"]
                 if len(draws) == len(live) - 1:
                     winner = next(p for p in live if p not in draws)
                     g.status = "FINISHED"
                     g.compute_scores()
-                    return {"ok": True, "status": "WIN", "state": g.to_public_state(),"msg":f"{winner.name} Wins, others Draw."}
 
-            # Continue
+                    return {"ok": True, "status": "WIN", "state": g.to_public_state(),
+                            "msg": f"{winner.name} Wins, others Draw."}
+
+            # Continue game
             g.advance_turn()
             g.compute_scores()
-            return {"ok": True, "status": "CONTINUE", "state": g.to_public_state()}
 
+            return {"ok": True, "status": "CONTINUE",
+                    "state": g.to_public_state()}
+
+    # ------------------------------
     def game_status_list(self) -> List[Dict[str, Any]]:
         with self.lock:
             return [
@@ -502,16 +503,18 @@ SESSION = Session()
 def handle_request(req: Dict[str, Any]) -> Dict[str, Any]:
     op = req.get("op")
 
-    
     if op == "get_legal_moves":
         return SESSION.get_legal_moves(
             req.get("game_id"),
             req.get("player_id")
         )
+
     if op == "join":
         return SESSION.join_request(req.get("player_name"))
+
     if op == "start":
         return SESSION.mark_start_ready(req.get("game_id"), req.get("player_id"))
+
     if op == "get_state":
         game_id = req.get("game_id")
         g = SESSION.games.get(game_id)
@@ -519,6 +522,7 @@ def handle_request(req: Dict[str, Any]) -> Dict[str, Any]:
             return {"ok": False, "error": "Game not found"}
         g.ensure_time_limits()
         return {"ok": True, "state": g.to_public_state()}
+
     if op == "move":
         return SESSION.validate_and_apply_move(
             req.get("game_id"),
@@ -526,6 +530,7 @@ def handle_request(req: Dict[str, Any]) -> Dict[str, Any]:
             int(req.get("pin_id")),
             int(req.get("to_index")),
         )
+
     if op == "status":
         return {"ok": True, "games": SESSION.game_status_list()}
 
@@ -538,23 +543,18 @@ def handle_request(req: Dict[str, Any]) -> Dict[str, Any]:
 def server_loop():
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind((HOST, PORT))
+    s.bind(("0.0.0.0", 50555))
     s.listen(50)
-
-    print(f"[Server] Listening on {HOST}:{PORT}")
-    debug("Server loop started.")
+    print("[Server] Listening on 0.0.0.0:50555")
 
     while True:
         conn, addr = s.accept()
-        debug(f"Accepted connection from {addr}")
-
         try:
             conn.settimeout(10.0)
             data = conn.recv(65535)
             if not data:
                 conn.close()
                 continue
-
             try:
                 req = json.loads(data.decode("utf-8"))
             except:
@@ -571,12 +571,14 @@ def server_loop():
             conn.close()
 
 
+
+
 # ==========================================================
-# CLI
+# CLI LOOP
 # ==========================================================
 def cli_loop():
     print("Game Manager")
-    print("Commands: Create | Status | Quit\n")
+    print("Commands: Create, Status, Quit\n")
 
     while True:
         cmd = input("Enter command: ").strip().lower()
@@ -592,6 +594,9 @@ def cli_loop():
             print("Invalid command")
 
 
+# ==========================================================
+# ENTRY POINT
+# ==========================================================
 if __name__ == "__main__":
     threading.Thread(target=server_loop, daemon=True).start()
     cli_loop()

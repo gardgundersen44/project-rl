@@ -18,52 +18,6 @@ def debug(*args):
     if DEBUG_NET:
         print("[NET]", *args)
 
-def render_ascii_from_json(state):
-    """
-    Render the hex board in ASCII using only the JSON state.
-    No HexBoard, no Pin classes required.
-
-    The board is represented as 121 cells arranged in 11 rows:
-    Row length pattern:  9 10 11 12 13 14 13 12 11 10 9
-    This matches the Chinese Checkers star-shaped center hex.
-
-    Each cell in the JSON is rendered with:
-        '.' for empty
-        first letter of colour for occupied
-    """
-
-    pins = state.get("pins", {})
-
-    # Build an occupancy map: index -> symbol
-    occ = {}
-    for colour, idx_list in pins.items():
-        symbol = colour[0].upper()   # R,L,Y,B,G,P
-        for idx in idx_list:
-            occ[int(idx)] = symbol
-
-    # Known row sizes for a 121‑cell Chinese Checkers-like board
-    row_lengths = [9,10,11,12,13,14,13,12,11,10,9]
-
-    # Build rows according to lengths
-    rows = []
-    cur = 0
-    for length in row_lengths:
-        row_cells = []
-        for _ in range(length):
-            idx = cur
-            cur += 1
-            cell = occ.get(idx, ".")
-            row_cells.append(cell)
-        rows.append(row_cells)
-
-    # Center the board visually for ASCII output
-    widest = max(len(r) for r in rows)
-
-    print("\n=== ASCII BOARD ===")
-    for r in rows:
-        pad = " " * ((widest - len(r)) * 2)
-        print(pad + " ".join(r))
-    print("===================\n")
 
 def rpc(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Send JSON to server and receive JSON reply."""
@@ -106,6 +60,7 @@ def render_json_board(state):
 # Main client loop
 # =============================================================
 def main():
+    timeoutnotice_move = -1
     print("==== Player ====")
     name = input("Enter name: ").strip()
     if not name:
@@ -155,8 +110,10 @@ def main():
         state = st["state"]
 
         # Timeout messages
-        if state.get("turn_timeout_notice"):
+        if state.get("turn_timeout_notice") and timeoutnotice_move< state.get("move_count"):
             print("⚠ TIMEOUT:", state["turn_timeout_notice"])
+            timeoutnotice_move =  state.get("move_count")
+
 
         # Finished?
         if state["status"] == "FINISHED":
@@ -189,10 +146,12 @@ def main():
                 )
             last_move_seen = state["move_count"]
 
+        
         # If it's our turn, choose a random move
         if state.get("current_turn_colour") == colour and state["status"] == "PLAYING":
+            print("\nMy turn")
+            '''------------PLAYING LOGIC-----------'''
             # Request legal moves for each pin from server
-            # Since player.py no longer knows how to compute moves, we add a request:
             legal_req = rpc({
                 "op": "get_legal_moves",
                 "game_id": game_id,
@@ -221,6 +180,7 @@ def main():
             delay = random.randint(1, 12)
             print("Randomized delay:", delay)
             time.sleep(delay)
+            '''-----------------PLAYING LOGIC----------------'''
 
             mv = rpc({
                 "op": "move",
